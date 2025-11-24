@@ -1,0 +1,171 @@
+@Library('jenkins-shared-lib') _
+
+pipeline {
+    agent { label "worker" }
+
+    tools {
+        maven 'M3'
+    }
+
+    environment {
+        JAVA_HOME = '/usr/lib/jvm/java-21-openjdk-amd64'
+        PATH = "${JAVA_HOME}/bin:${PATH}"
+
+        // AWS ECR Details
+        AWS_ACCOUNT_ID = '246005668592'
+        AWS_REGION = 'eu-north-1'
+        ECR_REPO_NAME = 'my-maven-app-chart'
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+        // DockerHub Image (your Spring Boot app)
+        DOCKER_IMAGE = "aslahea/springboot-maven-app"
+
+        // Sonar
+        SONAR_PROJECT_KEY = 'com.mycompany.app:springboot-maven-app'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scmGit(
+                    branches: [[name: '*/main']],
+                    userRemoteConfigs: [[url: 'https://github.com/aslahea/springboot-maven-app.git']]
+                )
+            }
+        }
+
+        stage('Maven Build') {
+            steps {
+                sh '''
+                    mvn -B clean package -DskipTests
+                '''
+            }
+        }
+
+        stage('Unit Test') {
+            steps {
+                sh '''
+                    mvn test || true
+                '''
+                junit allowEmptyResults: true, testResults: '**/target/surefire-reports/*.xml'
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('sonar') {
+                    withCredentials([string(credentialsId: 'sonar-token', variable: 'TOKEN')]) {
+                        sh '''
+                            mvn sonar:sonar \
+                              -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                              -Dsonar.login=${TOKEN}
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            options { timeout(time: 2, unit: 'MINUTES') }
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('DockerHub Login') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'dockerCred',
+                                usernameVariable: 'DOCKER_USER',
+                                passwordVariable: 'DOCKER_PASS')]) {
+                    sh '''
+                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                    '''
+                }
+            }
+        }
+
+        stage('Build & Push Docker Image') {
+            steps {
+                sh """
+                    docker build -t ${DOCKER_IMAGE}:${BUILD_NUMBER} .
+                    docker tag ${DOCKER_IMAGE}:${BUILD_NUMBER} ${DOCKER_IMAGE}:latest
+                    docker push ${DOCKER_IMAGE}:${BUILD_NUMBER}
+                    docker push ${DOCKER_IMAGE}:latest
+                """
+            }
+        }
+
+        stage('Fetch Helm Chart Repo') {
+            steps {
+                sh '''
+                    rm -rf helm-chart
+                    git clone https://github.com/aslahea/springboot-helm-chart.git helm-chart
+                '''
+            }
+        }
+
+        stage('Update Helm Chart & Package') {
+            steps {
+                dir('helm-chart') {
+                    sh """
+                        sed -i 's|tag:.*|tag: "${BUILD_NUMBER}"|' values.yaml
+                        sed -i 's|repository:.*|repository: "${DOCKER_IMAGE}"|' values.yaml
+
+                        helm package .
+                    """
+                }
+
+                archiveArtifacts artifacts: 'helm-chart/*.tgz', fingerprint: true
+            }
+        }
+
+        stage('Push Helm Chart to AWS ECR') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'aws-ecr-creds',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+        
+                    sh '''
+                        # Configure AWS
+                        aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+                        aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+                        aws configure set default.region eu-north-1
+        
+                        # Login HELM to ECR
+                        aws ecr get-login-password --region eu-north-1 \
+                          | helm registry login --username AWS --password-stdin $ECR_REGISTRY
+        
+                        cd helm-chart
+        
+                        # Auto-detect packaged .tgz file
+                        CHART=$(ls *-0.1.0.tgz | head -n 1)
+        
+                        echo "📦 Pushing chart: $CHART"
+        
+                        # IMPORTANT: Push only to registry root, NOT repo name
+                        helm push $CHART oci://$ECR_REGISTRY/
+                    '''
+                }
+            }
+        }
+
+        stage('Trigger Deploy Job') {
+            steps {
+                build job: 'Deploy-Job', parameters: [
+                    string(name: 'BUILD_NUMBER', value: "${BUILD_NUMBER}"),
+                    string(name: 'ECR_REGISTRY', value: "${ECR_REGISTRY}"),
+                    string(name: 'ECR_REPO_NAME', value: "${ECR_REPO_NAME}")
+                ]
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+    }
+}
