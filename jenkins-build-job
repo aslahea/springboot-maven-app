@@ -164,6 +164,30 @@ pipeline {
     }
 
     post {
+        success {
+            echo ' Pipeline completed successfully!'
+            sendEmailNotification(
+                currentBuild.currentResult,
+                [:]
+            )
+        }
+        
+        failure {
+            echo ' Pipeline failed!'
+            sendEmailNotification(
+                currentBuild.currentResult,
+                [:]
+            )
+        }
+    
+        aborted {
+            echo ' Pipeline aborted!'
+            sendEmailNotification(
+                currentBuild.currentResult,
+                [:]
+            )
+        }
+    
         always {
             cleanWs()
         }
