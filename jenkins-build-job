@@ -143,7 +143,7 @@ pipeline {
                         # Auto-detect packaged .tgz file
                         CHART=$(ls *-0.1.0.tgz | head -n 1)
         
-                        echo "📦 Pushing chart: $CHART"
+                        echo "Pushing chart: $CHART"
         
                         # IMPORTANT: Push only to registry root, NOT repo name
                         helm push $CHART oci://$ECR_REGISTRY/
