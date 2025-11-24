@@ -1,0 +1,59 @@
+pipeline {
+    agent { label "k8s-node" }
+
+    parameters {
+        string(name: 'BUILD_NUMBER', description: 'Build number from CI')
+        string(name: 'ECR_REGISTRY', description: 'AWS ECR registry URL')
+    }
+
+    environment {
+        AWS_REGION = 'eu-north-1'
+        CHART_REPO = 'my-maven-app-chart'
+    }
+
+    stages {
+
+        stage('Login to ECR') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'aws-ecr-creds',
+                    usernameVariable: 'AWS_ACCESS_KEY_ID',
+                    passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                )]) {
+                    sh '''
+                        aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+                        aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+                        aws configure set default.region $AWS_REGION
+                        aws ecr get-login-password --region $AWS_REGION | \
+                        helm registry login --username AWS --password-stdin $ECR_REGISTRY
+                    '''
+                }
+            }
+        }
+
+        stage('Pull Helm Chart') {
+            steps {
+                sh '''
+                    helm pull oci://$ECR_REGISTRY/$CHART_REPO --version 0.1.0
+                    tar -xvf $CHART_REPO-0.1.0.tgz
+                '''
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                sh '''
+                    helm upgrade --install my-maven-app ./$CHART_REPO \
+                      --set image.tag=$BUILD_NUMBER
+                '''
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                sh 'kubectl get pods'
+                sh 'kubectl get svc'
+            }
+        }
+    }
+}
